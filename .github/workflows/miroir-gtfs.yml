@@ -1,0 +1,67 @@
+name: Miroir GTFS
+
+# Recopie chaque jour le GTFS officiel de data.public.lu dans une release de ce dépôt.
+# Une nouvelle release n'est créée que si le fichier publié a changé (empreinte sha256).
+on:
+  schedule:
+    - cron: "15 5 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miroir-gtfs
+  cancel-in-progress: false
+
+jobs:
+  miroir:
+    runs-on: ubuntu-latest
+    env:
+      DATASET: horaires-et-arrets-des-transport-publics-gtfs
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Interroger l'API data.public.lu
+        run: |
+          curl -sSfL "https://data.public.lu/api/1/datasets/${DATASET}/" -o dataset.json
+          jq '[.resources[]
+               | select(((.format // "") | ascii_downcase) == "zip" or (.url | ascii_downcase | endswith(".zip")))]
+              | max_by(.last_modified // .created_at // "")' dataset.json > resource.json
+          jq -r '"Ressource la plus récente : \(.title) (\(.last_modified))"' resource.json
+
+      - name: Télécharger et vérifier le ZIP
+        run: |
+          curl -sSfL "$(jq -r .url resource.json)" -o gtfs.zip
+          for f in routes.txt trips.txt stop_times.txt stops.txt calendar.txt calendar_dates.txt; do
+            unzip -l gtfs.zip | grep -q "$f" || { echo "Fichier manquant : $f"; exit 1; }
+          done
+          echo "SHA=$(sha256sum gtfs.zip | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Écrire la provenance (_source.json)
+        run: |
+          jq -n --slurpfile d dataset.json --slurpfile r resource.json \
+             --arg slug "$DATASET" --arg sha "$SHA" --arg now "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" '{
+               dataset: $slug,
+               license: $d[0].license,
+               resource_id: $r[0].id,
+               resource_title: $r[0].title,
+               resource_url: $r[0].url,
+               resource_last_modified: $r[0].last_modified,
+               sha256: $sha,
+               downloaded_at: $now
+             }' > _source.json
+          cat _source.json
+
+      - name: Publier une release si le GTFS a changé
+        run: |
+          DAY=$(jq -r '.resource_last_modified // ""' _source.json | cut -c1-10 | tr -d -)
+          TAG="gtfs-${DAY:-$(date -u +%Y%m%d)}-${SHA:0:8}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Aucun changement : $TAG existe déjà."
+          else
+            gh release create "$TAG" gtfs.zip _source.json --repo "$GITHUB_REPOSITORY" --latest \
+              --title "GTFS $TAG" \
+              --notes "Copie du GTFS officiel ($(jq -r .resource_title _source.json)). Source : data.public.lu, licence CC-BY. sha256 : $SHA"
+          fi
