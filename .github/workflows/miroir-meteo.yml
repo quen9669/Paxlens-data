@@ -1,0 +1,86 @@
+name: Miroir météo
+
+# Recopie chaque jour la météo horaire (Open-Meteo, archive des prévisions, licence CC-BY 4.0)
+# sur 4 points du Luxembourg, dans une release fixe `meteo` (fichier cumulé meteo_horaire.csv).
+# Les 5 derniers jours sont toujours retéléchargés : les valeurs récentes peuvent être affinées.
+on:
+  schedule:
+    - cron: "45 2 * * *"   # avant le batch quotidien de PaxLens (03:30 UTC)
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/miroir-meteo.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miroir-meteo
+  cancel-in-progress: false
+
+jobs:
+  miroir:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEBUT: "2026-10-01"   # premier jour du fichier (couvre la semaine de référence du 14 octobre)
+    steps:
+      - name: Reprendre le fichier cumulé
+        run: gh release download meteo -p meteo_horaire.csv --repo "$GITHUB_REPOSITORY" || echo "Premier lancement"
+
+      - name: Télécharger les jours manquants et les 5 derniers jours
+        run: |
+          python3 - <<'PY'
+          import csv, datetime as dt, json, os, urllib.request
+          POINTS = {  # nom: (latitude, longitude)
+              "Luxembourg": (49.611, 6.130),
+              "Ettelbruck": (49.847, 6.104),
+              "Esch-sur-Alzette": (49.496, 5.981),
+              "Wasserbillig": (49.715, 6.500),
+          }
+          rows = {}
+          if os.path.exists("meteo_horaire.csv"):
+              for r in csv.DictReader(open("meteo_horaire.csv", encoding="utf-8")):
+                  rows[(r["point"], r["date"], r["hour"])] = r
+          end = dt.date.today() - dt.timedelta(days=1)
+          known = max((dt.date.fromisoformat(k[1]) for k in rows), default=None)
+          start = dt.date.fromisoformat(os.environ["DEBUT"]) if known is None else known - dt.timedelta(days=5)
+          for name, (lat, lon) in POINTS.items():
+              url = (
+                  "https://historical-forecast-api.open-meteo.com/v1/forecast"
+                  f"?latitude={lat}&longitude={lon}&start_date={start}&end_date={end}"
+                  "&hourly=temperature_2m,precipitation&timezone=Europe%2FLuxembourg"
+              )
+              req = urllib.request.Request(url, headers={"User-Agent": "paxlens-data-meteo/0.1"})
+              h = json.load(urllib.request.urlopen(req, timeout=120))["hourly"]
+              seen = set()
+              for t, temp, prec in zip(h["time"], h["temperature_2m"], h["precipitation"]):
+                  key = (name, t[:10], str(int(t[11:13])))
+                  if key in seen or temp is None:  # heure doublée au passage à l'heure d'hiver : 1re gardée
+                      continue
+                  seen.add(key)
+                  rows[key] = {"point": name, "latitude": lat, "longitude": lon, "date": key[1], "hour": key[2],
+                               "temperature_c": temp, "precipitation_mm": prec}
+              print(f"{name} : {start} -> {end}, {len(seen)} heures")
+          cols = ["point", "latitude", "longitude", "date", "hour", "temperature_c", "precipitation_mm"]
+          with open("meteo_horaire.csv", "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              for k in sorted(rows, key=lambda k: (k[0], k[1], int(k[2]))):
+                  w.writerow({c: rows[k][c] for c in cols})
+          src = {"source": "Open-Meteo, Historical Forecast API", "url": "https://open-meteo.com/",
+                 "license": "CC-BY 4.0", "points": POINTS, "first_date": min(k[1] for k in rows),
+                 "last_date": max(k[1] for k in rows),
+                 "downloaded_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds")}
+          json.dump(src, open("meteo_source.json", "w"), indent=2, ensure_ascii=False)
+          print(json.dumps(src, indent=2, ensure_ascii=False))
+          PY
+
+      - name: Publier dans la release fixe `meteo`
+        run: |
+          if gh release view meteo --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload meteo meteo_horaire.csv meteo_source.json --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create meteo meteo_horaire.csv meteo_source.json --repo "$GITHUB_REPOSITORY" --latest=false \
+              --title "Météo horaire (cumulée)" \
+              --notes "Météo horaire de 4 points du Luxembourg. Source : Open-Meteo (open-meteo.com), licence CC-BY 4.0."
+          fi
